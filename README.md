@@ -1,5 +1,23 @@
 # luci-app-tgeekddns v0.2.2
 
+## 通过 wget 直接安装
+
+安装下文所列依赖后，通过 SSH 以 root 执行。下载或解压失败时会停止。
+
+```sh
+(
+    set -e
+    workdir="$(mktemp -d /tmp/tgeekddns.XXXXXX)"
+    trap 'rm -rf "$workdir"' EXIT
+    cd "$workdir"
+    wget -T 30 -O source.tar.gz "https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.2.2.tar.gz"
+    tar -xzf source.tar.gz
+    cd tgeek-ddns-openwrt-0.2.2
+    sh install.sh
+)
+```
+
+
 OpenWrt LuCI 扩展，安装后进入 **服务 → TGEEK DDNS**。支持阿里云和腾讯云 DNSPod。页面可保存域名、主机记录、API 凭据，分别配置 A 和 AAAA 的记录 ID 与逻辑接口，并启停接口事件更新。
 
 ## 全新 OpenWrt 安装
