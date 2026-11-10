@@ -100,19 +100,56 @@ def tencent(cfg, action, **params):
     return result
 
 
+def discover_id(provider, cfg, kind):
+    domain, rr = cfg["domain"], cfg["rr"]
+    limit = 100
+    candidates = {}
+    for page in range(1, 21):
+        if provider == "aliyun":
+            result = aliyun(cfg, "DescribeDomainRecords", DomainName=domain,
+                            RRKeyWord=rr, TypeKeyWord=kind, SearchMode="EXACT",
+                            PageSize=limit, PageNumber=page)
+            rows = result.get("DomainRecords", {}).get("Record", [])
+            total = int(result["TotalCount"])
+            name, kind_field = "RR", "Type"
+        else:
+            result = tencent(cfg, "DescribeRecordList", Domain=domain, SubDomain=rr,
+                             RecordType=kind, Limit=limit, Offset=(page - 1) * limit,
+                             ErrorOnEmpty="no")
+            rows = result.get("RecordList") or []
+            total = int(result["RecordCountInfo"]["ListCount"])
+            name, kind_field = "Name", "Type"
+        for row in rows:
+            if row[name].lower() == rr and row[kind_field] == kind:
+                candidates[str(row["RecordId"])] = row
+        if len(candidates) > 1:
+            ids = ", ".join(sorted(candidates))
+            raise Failure(f"找到多条 {kind} 记录（ID {ids}），请指定要更新的记录 ID")
+        if (page - 1) * limit + len(rows) >= total:
+            break
+        if len(rows) < limit:
+            raise Failure("云端记录列表不完整，请重试或指定记录 ID")
+    else:
+        raise Failure("云端记录过多，请指定记录 ID")
+    if not candidates:
+        raise Failure(f"云端找不到匹配的 {kind} 记录，请先在控制台创建")
+    return next(iter(candidates))
+
+
 def lookup(provider, cfg, kind):
-    domain, rr, record_id = cfg["domain"], cfg["rr"], cfg["records"][kind]["id"]
+    domain, rr, record_id = cfg["domain"], cfg["rr"], cfg["records"][kind].get("id", "")
+    record_id = record_id or discover_id(provider, cfg, kind)
     if provider == "aliyun":
         item = aliyun(cfg, "DescribeDomainRecordInfo", RecordId=record_id)
         if (item["DomainName"].rstrip(".").lower(), item["RR"].lower(), item["Type"]) != (domain, rr, kind):
             raise Failure("记录 ID 与域名、主机记录或类型不匹配")
-        if item.get("Status") != "ENABLE":
+        if str(item.get("Status", "")).upper() != "ENABLE":
             raise Failure("记录已停用")
         return item, item["Value"]
     item = tencent(cfg, "DescribeRecord", Domain=domain, RecordId=int(record_id))["RecordInfo"]
     if (item["SubDomain"].lower(), item["RecordType"], str(item["Id"])) != (rr, kind, record_id):
         raise Failure("记录 ID 与主机记录或类型不匹配")
-    if str(item.get("Enabled")) != "1" and item.get("Status") != "ENABLE":
+    if str(item.get("Enabled")) != "1" and str(item.get("Status", "")).upper() != "ENABLE":
         raise Failure("记录已停用或状态未知")
     return item, item["Value"]
 
@@ -168,8 +205,15 @@ def select(rows, source, kind):
 PUBLIC_V6 = ipaddress.ip_network("2000::/3")
 
 
+def recent_logs():
+    path = RUN / "recent.json"
+    return json.loads(path.read_text()) if path.exists() else []
+
+
 def log(message, event):
     syslog.syslog(message)
+    now = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    save(RUN / "recent.json", [f"{now} {message}", *recent_logs()[:9]])
     if not event:
         print(message, flush=True)
 
@@ -186,7 +230,7 @@ def sync(mode, event):
         cfg = json.loads(path.read_text())
         for kind, record in cfg["records"].items():
             label = f'{provider} {cfg["rr"]} / {cfg["domain"]} {kind}'
-            key = f'{provider}/{cfg["domain"]}/{cfg["rr"]}/{kind}/{record["id"]}'
+            key = f'{provider}/{cfg["domain"]}/{cfg["rr"]}/{kind}/{record.get("id", "")}'
             try:
                 name, ip = select(rows, record["source"], kind)
                 if mode == "event" and state.get(key) == ip:
@@ -239,8 +283,8 @@ def configure(provider):
     records = {}
     for kind in kinds:
         source = ask(f"{kind} 地址来源，auto 或 OpenWrt 逻辑接口", "auto")
-        record_id = ask(f"{kind} 已有 DNS 记录 ID")
-        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or not re.fullmatch(r"[0-9]+", record_id):
+        record_id = ask(f"{kind} 已有 DNS 记录 ID（留空自动查找）")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or (record_id and not re.fullmatch(r"[0-9]+", record_id)):
             raise Failure("接口名或记录 ID 无效")
         records[kind] = {"id": record_id, "source": source}
     names = ("AccessKey ID", "AccessKey Secret") if provider == "aliyun" else ("SecretId", "SecretKey")
@@ -273,7 +317,7 @@ def web(method):
                 }
         dump = subprocess.check_output(["ubus", "call", "network.interface", "dump"], timeout=3)
         names = sorted(row["interface"] for row in json.loads(dump)["interface"])
-        return {"providers": providers, "interfaces": names, "enabled": HOOK.exists()}
+        return {"providers": providers, "interfaces": names, "enabled": HOOK.exists(), "logs": recent_logs()}
     if method != "save":
         raise Failure("未知操作")
     data = json.loads(json.load(sys.stdin)["payload"])
@@ -293,7 +337,7 @@ def web(method):
     records = {}
     for kind, record in data["records"].items():
         source, record_id = record["source"].strip(), record["id"].strip()
-        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or not re.fullmatch(r"[0-9]+", record_id):
+        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or (record_id and not re.fullmatch(r"[0-9]+", record_id)):
             raise Failure(f"{kind} 接口或记录 ID 无效")
         records[kind] = {"source": source, "id": record_id}
     key, secret = data["key"].strip(), data["secret"].strip()
