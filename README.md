@@ -30,7 +30,7 @@ sh install.sh
 
 ```sh
 cd /tmp
-wget -O tgeek-ddns-source.tar.gz 'https://github.com/OWNER/REPO/archive/refs/heads/main.tar.gz' &&
+wget -O tgeek-ddns-source.tar.gz 'https://github.com/OWNER/REPO/archive/refs/heads/main.tar.gz](https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.1.0.tar.gz' &&
     tar -xzf tgeek-ddns-source.tar.gz &&
     cd REPO-main &&
     sh install.sh
