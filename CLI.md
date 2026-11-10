@@ -82,7 +82,7 @@ tgeek-ddns check
 
 检查结果应列出配置对应的接口、本机地址和云端地址。当前两者不同可以继续，首次同步会更新云端。如果提示权限、地址或记录 ID 有误，先修正后再切换。
 
-在 TIJIWrt 上，先确认以下旧入口是否管理同一条记录：
+在 OpenWrt 上，先确认以下旧入口是否管理同一条记录：
 
 - 阿里云的 `/etc/hotplug.d/iface/81-aliddns-event`。
 - 腾讯云的旧服务，以及它可能生成的事件脚本。还要检查 `/etc/hotplug.d/iface/80-tencentddns.bak`。
