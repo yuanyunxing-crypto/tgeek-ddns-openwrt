@@ -60,6 +60,7 @@ function panel(provider, name, config, interfaces) {
 		const checked = E('input', { type: 'checkbox' });
 		checked.checked = record ? true : (!config && type === 'A');
 		const id = input(record && record.id);
+		id.placeholder = "留空自动查找";
 		const source = E('select', { class: 'cbi-input-select' });
 		for (const name of new Set(['auto', ...interfaces, ...(record ? [record.source] : [])]))
 			source.appendChild(E('option', { value: name }, name === 'auto' ? '自动选择' : name));
@@ -111,7 +112,10 @@ return view.extend({
 				if (response && response.ok) state.textContent = '事件更新已停用';
 				return response;
 			}, result),
-			result
+			result,
+			E('h3', {}, '最近 10 条日志'),
+			E('p', {}, '重新加载页面可查看最新结果。路由器重启后清空。'),
+			E('pre', { style: 'white-space: pre-wrap' }, (data.logs || []).join('\n') || '暂无日志')
 		]);
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null
