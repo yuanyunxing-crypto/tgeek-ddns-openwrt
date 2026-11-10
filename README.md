@@ -43,7 +43,7 @@ sh install.sh
     cd "$workdir"
     host=github.com
     repo=yuanyunxing-crypto/tgeek-ddns-openwrt
-    wget -T 30 -O source.tar.gz "https://$host/$repo/archive/refs/tags/v0.3.0.tar.gz"
+    wget -T 30 -O source.tar.gz "https://gh-proxy.com/https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.3.0.tar.gz"
     tar -xzf source.tar.gz
     cd tgeek-ddns-openwrt-0.3.0
     sh install.sh
