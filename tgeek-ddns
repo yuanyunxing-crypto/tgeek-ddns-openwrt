@@ -100,6 +100,23 @@ def tencent(cfg, action, **params):
     return result
 
 
+LINES = {
+    "aliyun": {"default": "default", "unicom": "unicom", "telecom": "telecom"},
+    "tencent": {"default": "默认", "unicom": "联通", "telecom": "电信"},
+}
+
+
+def tasks(cfg):
+    if "tasks" in cfg:
+        return cfg["tasks"]
+    return [dict(record, domain=cfg["domain"], rr=cfg["rr"], kind=kind, line="any")
+            for kind, record in cfg["records"].items()]
+
+
+def matches_line(provider, task, value):
+    return task["line"] == "any" or LINES[provider][task["line"]] == value
+
+
 def discover_id(provider, cfg, kind):
     domain, rr = cfg["domain"], cfg["rr"]
     limit = 100
@@ -120,7 +137,7 @@ def discover_id(provider, cfg, kind):
             total = int(result["RecordCountInfo"]["ListCount"])
             name, kind_field = "Name", "Type"
         for row in rows:
-            if row[name].lower() == rr and row[kind_field] == kind:
+            if row[name].lower() == rr and row[kind_field] == kind and matches_line(provider, cfg, row["Line"]):
                 candidates[str(row["RecordId"])] = row
         if len(candidates) > 1:
             ids = ", ".join(sorted(candidates))
@@ -137,18 +154,22 @@ def discover_id(provider, cfg, kind):
 
 
 def lookup(provider, cfg, kind):
-    domain, rr, record_id = cfg["domain"], cfg["rr"], cfg["records"][kind].get("id", "")
+    domain, rr, record_id = cfg["domain"], cfg["rr"], cfg.get("id", "")
     record_id = record_id or discover_id(provider, cfg, kind)
     if provider == "aliyun":
         item = aliyun(cfg, "DescribeDomainRecordInfo", RecordId=record_id)
         if (item["DomainName"].rstrip(".").lower(), item["RR"].lower(), item["Type"]) != (domain, rr, kind):
             raise Failure("记录 ID 与域名、主机记录或类型不匹配")
+        if not matches_line(provider, cfg, item["Line"]):
+            raise Failure("记录 ID 与所选解析线路不匹配")
         if str(item.get("Status", "")).upper() != "ENABLE":
             raise Failure("记录已停用")
         return item, item["Value"]
     item = tencent(cfg, "DescribeRecord", Domain=domain, RecordId=int(record_id))["RecordInfo"]
     if (item["SubDomain"].lower(), item["RecordType"], str(item["Id"])) != (rr, kind, record_id):
         raise Failure("记录 ID 与主机记录或类型不匹配")
+    if not matches_line(provider, cfg, item["RecordLine"]):
+        raise Failure("记录 ID 与所选解析线路不匹配")
     if str(item.get("Enabled")) != "1" and str(item.get("Status", "")).upper() != "ENABLE":
         raise Failure("记录已停用或状态未知")
     return item, item["Value"]
@@ -218,7 +239,7 @@ def log(message, event):
         print(message, flush=True)
 
 
-def sync(mode, event):
+def sync(mode, event, iface=None):
     state_path = RUN / "state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     rows = interfaces()
@@ -227,10 +248,14 @@ def sync(mode, event):
         path = ROOT / (provider + ".json")
         if not path.exists():
             continue
-        cfg = json.loads(path.read_text())
-        for kind, record in cfg["records"].items():
-            label = f'{provider} {cfg["rr"]} / {cfg["domain"]} {kind}'
-            key = f'{provider}/{cfg["domain"]}/{cfg["rr"]}/{kind}/{record.get("id", "")}'
+        settings = json.loads(path.read_text())
+        for record in tasks(settings):
+            source, kind, line = record["source"], record["kind"], record["line"]
+            if event and source != iface and not (source == "auto" and AUTO.fullmatch(iface)):
+                continue
+            cfg = dict(record, key=settings["key"], secret=settings["secret"])
+            label = f'{provider} {cfg["rr"]} / {cfg["domain"]} {kind} 线路={line}'
+            key = json.dumps([provider, cfg["domain"], cfg["rr"], kind, line, source, cfg.get("id", "")])
             try:
                 name, ip = select(rows, record["source"], kind)
                 if mode == "event" and state.get(key) == ip:
@@ -270,6 +295,9 @@ def configure(provider):
         raise Failure("请在交互式 SSH 终端配置")
     if HOOK.exists():
         raise Failure("请先执行 tgeek-ddns disable 再配置")
+    path = ROOT / (provider + ".json")
+    if path.exists() and "tasks" in json.loads(path.read_text()):
+        raise Failure("请在 LuCI 编辑任务，避免覆盖多条配置")
     domain = ask("云控制台托管域名，例如 example.com").rstrip(".").lower()
     rr = ask("主机记录，例如 oa，根域名填 @", "@").lower()
     if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
@@ -312,7 +340,7 @@ def web(method):
             if path.exists():
                 cfg = json.loads(path.read_text())
                 providers[provider] = {
-                    "domain": cfg["domain"], "rr": cfg["rr"], "records": cfg["records"],
+                    "tasks": tasks(cfg),
                     "credentials": bool(cfg.get("key") and cfg.get("secret")),
                 }
         dump = subprocess.check_output(["ubus", "call", "network.interface", "dump"], timeout=3)
@@ -326,27 +354,47 @@ def web(method):
         raise Failure("服务商无效")
     path = ROOT / (provider + ".json")
     old = json.loads(path.read_text()) if path.exists() else {}
-    domain = data["domain"].strip().rstrip(".").lower()
-    rr = data["rr"].strip().lower()
-    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
-        raise Failure("域名格式无效")
-    if rr != "@" and not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", rr):
-        raise Failure("主机记录格式无效")
-    if not data["records"] or set(data["records"]) - {"A", "AAAA"}:
-        raise Failure("请选择记录类型")
-    records = {}
-    for kind, record in data["records"].items():
-        source, record_id = record["source"].strip(), record["id"].strip()
+    rows = data["tasks"]
+    if not isinstance(rows, list) or len(rows) > 24:
+        raise Failure("每家服务商最多 24 条任务")
+    records = []
+    groups = {}
+    ids = set()
+    for row in rows:
+        domain = row["domain"].strip().rstrip(".").lower()
+        rr = row["rr"].strip().lower()
+        kind, line = row["kind"], row["line"]
+        source, record_id = row["source"].strip(), row["id"].strip()
+        if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+            raise Failure("域名格式无效")
+        if rr != "@" and not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", rr):
+            raise Failure("主机记录格式无效")
+        if kind not in ("A", "AAAA") or line not in ("any", *LINES[provider]):
+            raise Failure("记录类型或云端线路无效")
         if not re.fullmatch(r"[A-Za-z0-9_]+", source) or (record_id and not re.fullmatch(r"[0-9]+", record_id)):
-            raise Failure(f"{kind} 接口或记录 ID 无效")
-        records[kind] = {"source": source, "id": record_id}
+            raise Failure("接口或记录 ID 无效")
+        lines = groups.setdefault((domain, rr, kind), set())
+        if line in lines or "any" in lines or (line == "any" and lines):
+            raise Failure("同域名同类型的任务须分别选择不同的云端解析线路")
+        if record_id:
+            record_id = str(int(record_id))
+            if record_id in ids:
+                raise Failure("同一记录 ID 只能绑定一条任务")
+            ids.add(record_id)
+        lines.add(line)
+        records.append(dict(domain=domain, rr=rr, kind=kind, line=line, source=source, id=record_id))
+    if not records:
+        if old:
+            save(path, dict(key=old["key"], secret=old["secret"], tasks=[]))
+            (RUN / "state.json").unlink(missing_ok=True)
+        return {}
     key, secret = data["key"].strip(), data["secret"].strip()
     if bool(key) != bool(secret):
         raise Failure("请同时填写两项凭据，或同时留空")
     key, secret = (key, secret) if key else (old.get("key"), old.get("secret"))
     if not key or not secret:
         raise Failure("首次配置请填写两项凭据")
-    save(path, dict(domain=domain, rr=rr, key=key, secret=secret, records=records))
+    save(path, dict(key=key, secret=secret, tasks=records))
     (RUN / "state.json").unlink(missing_ok=True)
     return {}
 
@@ -365,13 +413,6 @@ def main():
             iface, action = args.args
             if not HOOK.exists():
                 return 0
-            relevant = any(
-                record["source"] == iface or (record["source"] == "auto" and AUTO.fullmatch(iface))
-                for path in ROOT.glob("*.json")
-                for record in json.loads(path.read_text())["records"].values()
-            )
-            if not relevant:
-                return 0
             time.sleep(5)
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.mode == "event" and not HOOK.exists():
@@ -387,7 +428,7 @@ def main():
                 parser.error("configure 需要 aliyun 或 tencent")
             configure(args.args[0])
         elif args.mode == "enable":
-            if not any((ROOT / (p + ".json")).exists() for p in PROVIDERS):
+            if not any(tasks(json.loads(path.read_text())) for path in ROOT.glob("*.json")):
                 raise Failure("请先配置至少一家云服务")
             (RUN / "state.json").unlink(missing_ok=True)
             # 在目录外完成写入，再原子发布热插拔入口。
@@ -405,7 +446,7 @@ def main():
             HOOK.unlink(missing_ok=True)
             print("事件触发已停用。")
         else:
-            return sync(args.mode, args.mode == "event")
+            return sync(args.mode, args.mode == "event", iface if args.mode == "event" else None)
     return 0
 
 
