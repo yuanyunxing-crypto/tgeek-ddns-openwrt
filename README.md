@@ -1,4 +1,4 @@
-# luci-app-tgeekddns v0.3.0
+# luci-app-tgeekddns v0.3.1
 
 OpenWrt LuCI 扩展，安装后进入 **服务 → TGEEK DDNS**。支持阿里云和腾讯云 DNSPod。页面可保存域名、主机记录、API 凭据，分别配置 A 和 AAAA 的记录 ID 与逻辑接口，并启停接口事件更新。
 
@@ -22,10 +22,10 @@ opkg install python3 ca-bundle
 
 若系统使用 apk，请用该系统的软件源安装对应的 LuCI、Python 3 和 CA 软件包。此包为源码安装包。
 
-在电脑解压 ZIP，把整个 `luci-app-tgeekddns-0.3.0` 目录上传到路由器 `/tmp`。也可上传 ZIP 后用路由器上的 unzip 解压。然后执行：
+在电脑解压 ZIP，把整个 `luci-app-tgeekddns-0.3.1` 目录上传到路由器 `/tmp`。也可上传 ZIP 后用路由器上的 unzip 解压。然后执行：
 
 ```sh
-cd /tmp/luci-app-tgeekddns-0.3.0
+cd /tmp/luci-app-tgeekddns-0.3.1
 sh install.sh
 ```
 
@@ -43,9 +43,9 @@ sh install.sh
     cd "$workdir"
     host=github.com
     repo=yuanyunxing-crypto/tgeek-ddns-openwrt
-    wget -T 30 -O source.tar.gz "https://gh-proxy.com/https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.3.0.tar.gz"
+    wget -T 30 -O source.tar.gz "https://gh-proxy.com/https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.3.1.tar.gz"
     tar -xzf source.tar.gz
-    cd tgeek-ddns-openwrt-0.3.0
+    cd tgeek-ddns-openwrt-0.3.1
     sh install.sh
 )
 ```
