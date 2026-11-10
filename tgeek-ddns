@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import datetime
+import fcntl
+import getpass
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import syslog
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+ROOT = Path("/etc/tgeek-ddns")
+RUN = Path("/var/run/tgeek-ddns")
+HOOK = Path("/etc/hotplug.d/iface/90-tgeek-ddns")
+PROVIDERS = ("aliyun", "tencent")
+AUTO = re.compile(r"wan(?:[0-9]+)?(?:_6)?", re.I)
+
+
+class Failure(Exception):
+    pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def request(host, body, headers):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    req = urllib.request.Request("https://" + host + "/", body, headers)
+    try:
+        with opener.open(req, timeout=12) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            result = json.load(exc)
+        except (ValueError, OSError):
+            raise Failure(f"HTTP {exc.code}") from None
+        if isinstance(result, dict) and ("Code" in result or "Response" in result):
+            return result
+        raise Failure(f"HTTP {exc.code}") from None
+
+
+def digest(key, message, algorithm="sha256"):
+    return hmac.digest(key, message.encode(), algorithm)
+
+
+def aliyun(cfg, action, **params):
+    def encode(value):
+        return urllib.parse.quote(str(value), safe="-_.~")
+
+    params.update(Action=action, Version="2015-01-09", Format="JSON",
+                  AccessKeyId=cfg["key"], SignatureMethod="HMAC-SHA1",
+                  SignatureVersion="1.0", SignatureNonce=str(uuid.uuid4()),
+                  Timestamp=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    canonical = "&".join(encode(k) + "=" + encode(v) for k, v in sorted(params.items()))
+    signature = digest((cfg["secret"] + "&").encode(), "POST&%2F&" + encode(canonical), "sha1")
+    body = canonical + "&Signature=" + encode(base64.b64encode(signature).decode())
+    result = request("alidns.aliyuncs.com", body.encode(),
+                     {"Content-Type": "application/x-www-form-urlencoded"})
+    if result.get("Code"):
+        raise Failure(action + " " + result["Code"])
+    return result
+
+
+def tencent(cfg, action, **params):
+    host = "dnspod.tencentcloudapi.com"
+    content_type = "application/json; charset=utf-8"
+    timestamp = int(time.time())
+    date = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).strftime("%Y-%m-%d")
+    body = json.dumps(params, separators=(",", ":")).encode()
+    signed = "content-type;host;x-tc-action"
+    canonical = (f"POST\n/\n\ncontent-type:{content_type}\nhost:{host}\n"
+                 f"x-tc-action:{action.lower()}\n\n{signed}\n{hashlib.sha256(body).hexdigest()}")
+    scope = date + "/dnspod/tc3_request"
+    message = f"TC3-HMAC-SHA256\n{timestamp}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+    key = digest(("TC3" + cfg["secret"]).encode(), date)
+    key = digest(digest(key, "dnspod"), "tc3_request")
+    signature = digest(key, message).hex()
+    authorization = (f'TC3-HMAC-SHA256 Credential={cfg["key"]}/{scope}, '
+                     f"SignedHeaders={signed}, Signature={signature}")
+    result = request(host, body, {
+        "Host": host, "Content-Type": content_type, "Authorization": authorization,
+        "X-TC-Action": action, "X-TC-Timestamp": str(timestamp), "X-TC-Version": "2021-03-23",
+    })["Response"]
+    if "Error" in result:
+        raise Failure(action + " " + result["Error"]["Code"])
+    return result
+
+
+def lookup(provider, cfg, kind):
+    domain, rr, record_id = cfg["domain"], cfg["rr"], cfg["records"][kind]["id"]
+    if provider == "aliyun":
+        item = aliyun(cfg, "DescribeDomainRecordInfo", RecordId=record_id)
+        if (item["DomainName"].rstrip(".").lower(), item["RR"].lower(), item["Type"]) != (domain, rr, kind):
+            raise Failure("记录 ID 与域名、主机记录或类型不匹配")
+        if item.get("Status") != "ENABLE":
+            raise Failure("记录已停用")
+        return item, item["Value"]
+    item = tencent(cfg, "DescribeRecord", Domain=domain, RecordId=int(record_id))["RecordInfo"]
+    if (item["SubDomain"].lower(), item["RecordType"], str(item["Id"])) != (rr, kind, record_id):
+        raise Failure("记录 ID 与主机记录或类型不匹配")
+    if str(item.get("Enabled")) != "1" and item.get("Status") != "ENABLE":
+        raise Failure("记录已停用或状态未知")
+    return item, item["Value"]
+
+
+def update(provider, cfg, kind, item, ip):
+    if provider == "aliyun":
+        aliyun(cfg, "UpdateDomainRecord", RecordId=item["RecordId"], RR=cfg["rr"],
+               Type=kind, Value=ip, TTL=item["TTL"], Line=item["Line"])
+    else:
+        tencent(cfg, "ModifyRecord", Domain=cfg["domain"], RecordId=item["Id"],
+                SubDomain=cfg["rr"], RecordType=kind, Value=ip, TTL=item["TTL"],
+                RecordLine=item["RecordLine"], RecordLineId=item["RecordLineId"],
+                **({"Weight": item["Weight"]} if item.get("Weight") is not None else {}))
+
+
+def save(path, data):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        tmp = Path(out.name)
+        try:
+            json.dump(data, out, indent=2)
+            out.flush()
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def interfaces():
+    data = subprocess.check_output(["ubus", "call", "network.interface", "dump"], timeout=5)
+    return {row["interface"]: row for row in json.loads(data)["interface"] if row.get("up")}
+
+
+def select(rows, source, kind):
+    if source == "auto":
+        names = sorted((n for n in rows if AUTO.fullmatch(n)),
+                       key=lambda n: (n != ("wan" if kind == "A" else "wan6"), len(n), n))
+    else:
+        names = [source]
+    field, version = ("ipv4-address", 4) if kind == "A" else ("ipv6-address", 6)
+    for name in names:
+        valid = set()
+        for entry in rows.get(name, {}).get(field, []):
+            ip = ipaddress.ip_address(entry["address"])
+            if (ip.version == version and ip.is_global and not ip.is_multicast
+                    and not ip.is_reserved and (version == 4 or ip in PUBLIC_V6)):
+                valid.add(str(ip))
+        if len(valid) > 1:
+            raise Failure(f"{name} 有多个公网 {kind} 地址，无法唯一选择")
+        if valid:
+            return name, valid.pop()
+    raise Failure(f"{source} 当前无可用公网 {kind} 地址")
+
+
+PUBLIC_V6 = ipaddress.ip_network("2000::/3")
+
+
+def log(message, event):
+    syslog.syslog(message)
+    if not event:
+        print(message, flush=True)
+
+
+def sync(mode, event):
+    state_path = RUN / "state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    rows = interfaces()
+    failed = False
+    for provider in PROVIDERS:
+        path = ROOT / (provider + ".json")
+        if not path.exists():
+            continue
+        cfg = json.loads(path.read_text())
+        for kind, record in cfg["records"].items():
+            label = f'{provider} {cfg["rr"]} / {cfg["domain"]} {kind}'
+            key = f'{provider}/{cfg["domain"]}/{cfg["rr"]}/{kind}/{record["id"]}'
+            try:
+                name, ip = select(rows, record["source"], kind)
+                if mode == "event" and state.get(key) == ip:
+                    continue
+                item, remote = lookup(provider, cfg, kind)
+                try:
+                    equal = ipaddress.ip_address(remote) == ipaddress.ip_address(ip)
+                except ValueError:
+                    equal = False
+                if mode == "check":
+                    log(f"{label} 接口={name} 当前={ip} 云端={remote}", event)
+                    continue
+                if not equal:
+                    if key in state:
+                        del state[key]
+                        save(state_path, state)
+                    update(provider, cfg, kind, item, ip)
+                    log(f"{label} 接口={name} 云 API 已接受 {remote} -> {ip}", event)
+                else:
+                    log(f"{label} 接口={name} 云端已是 {ip}", event)
+                state[key] = ip
+                save(state_path, state)
+            except (Failure, OSError, ValueError, KeyError) as exc:
+                detail = str(exc) if isinstance(exc, Failure) else type(exc).__name__
+                log(f"{label} 跳过或失败 {detail}", event)
+                failed = True
+    return int(failed)
+
+
+def ask(prompt, default=None):
+    value = input(prompt + (f" [{default}]" if default else "") + " ").strip()
+    return value or default or ""
+
+
+def configure(provider):
+    if not os.isatty(0):
+        raise Failure("请在交互式 SSH 终端配置")
+    if HOOK.exists():
+        raise Failure("请先执行 tgeek-ddns disable 再配置")
+    domain = ask("云控制台托管域名，例如 example.com").rstrip(".").lower()
+    rr = ask("主机记录，例如 oa，根域名填 @", "@").lower()
+    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+        raise Failure("托管域名格式无效，国际化域名请填写 Punycode")
+    if rr != "@" and not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", rr):
+        raise Failure("主机记录格式无效")
+    choice = ask("记录类型 1=A  2=AAAA  3=A+AAAA", "1")
+    kinds = {"1": ("A",), "2": ("AAAA",), "3": ("A", "AAAA")}.get(choice)
+    if kinds is None:
+        raise Failure("记录类型无效")
+    records = {}
+    for kind in kinds:
+        source = ask(f"{kind} 地址来源，auto 或 OpenWrt 逻辑接口", "auto")
+        record_id = ask(f"{kind} 已有 DNS 记录 ID")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or not re.fullmatch(r"[0-9]+", record_id):
+            raise Failure("接口名或记录 ID 无效")
+        records[kind] = {"id": record_id, "source": source}
+    names = ("AccessKey ID", "AccessKey Secret") if provider == "aliyun" else ("SecretId", "SecretKey")
+    key, secret = (getpass.getpass(name + "：").strip() for name in names)
+    if not key or not secret:
+        raise Failure("API 凭据不能为空")
+    save(ROOT / (provider + ".json"), dict(domain=domain, rr=rr, key=key, secret=secret, records=records))
+    print("配置已保存。运行 tgeek-ddns check 验证。")
+
+
+HOOK_TEXT = """#!/bin/sh
+case "$ACTION" in
+    ifup|ifupdate|ifdown)
+        /usr/sbin/tgeek-ddns event "$INTERFACE" "$ACTION" </dev/null >/dev/null 2>&1 &
+        ;;
+esac
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("configure", "check", "sync", "enable", "disable", "event"))
+    parser.add_argument("args", nargs="*")
+    args = parser.parse_args()
+    os.umask(0o077)
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    RUN.mkdir(mode=0o700, exist_ok=True)
+    syslog.openlog("tgeek-ddns")
+    with (RUN / "lock").open("a") as lock:
+        if args.mode == "event":
+            iface, action = args.args
+            if not HOOK.exists():
+                return 0
+            relevant = any(
+                record["source"] == iface or (record["source"] == "auto" and AUTO.fullmatch(iface))
+                for path in ROOT.glob("*.json")
+                for record in json.loads(path.read_text())["records"].values()
+            )
+            if not relevant:
+                return 0
+            time.sleep(5)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.mode == "event" and not HOOK.exists():
+            return 0
+        if args.mode == "configure":
+            if len(args.args) != 1 or args.args[0] not in PROVIDERS:
+                parser.error("configure 需要 aliyun 或 tencent")
+            configure(args.args[0])
+        elif args.mode == "enable":
+            if not any((ROOT / (p + ".json")).exists() for p in PROVIDERS):
+                raise Failure("请先配置至少一家云服务")
+            (RUN / "state.json").unlink(missing_ok=True)
+            # 在目录外完成写入，再原子发布热插拔入口。
+            with tempfile.NamedTemporaryFile(mode="w", dir=HOOK.parent.parent, delete=False) as out:
+                tmp = Path(out.name)
+                try:
+                    out.write(HOOK_TEXT)
+                    out.flush()
+                    tmp.chmod(0o755)
+                    os.replace(tmp, HOOK)
+                finally:
+                    tmp.unlink(missing_ok=True)
+            print("事件触发已启用。运行 tgeek-ddns sync 可立即同步。")
+        elif args.mode == "disable":
+            HOOK.unlink(missing_ok=True)
+            print("事件触发已停用。")
+        else:
+            return sync(args.mode, args.mode == "event")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (Failure, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        message = str(exc) if isinstance(exc, Failure) else type(exc).__name__
+        syslog.syslog("执行失败 " + message)
+        raise SystemExit("执行失败 " + message) from None
