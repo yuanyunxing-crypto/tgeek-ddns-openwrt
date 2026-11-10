@@ -1,0 +1,12 @@
+#!/bin/sh
+case "$1:$2" in
+    list:) echo '{"status":{},"save":{"payload":""},"enable":{},"disable":{}}' ;;
+    call:status|call:save) exec /usr/sbin/tgeek-ddns web "$2" ;;
+    call:enable|call:disable)
+        if /usr/sbin/tgeek-ddns "$2" >/dev/null 2>&1; then
+            echo '{"ok":true}'
+        else
+            echo '{"ok":false,"error":"操作失败，请确认至少已保存一家服务商配置"}'
+        fi ;;
+    *) exit 1 ;;
+esac

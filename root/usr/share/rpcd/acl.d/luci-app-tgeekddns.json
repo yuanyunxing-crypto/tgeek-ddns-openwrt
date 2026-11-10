@@ -1,0 +1,7 @@
+{
+  "luci-app-tgeekddns": {
+    "description": "TGEEK DDNS",
+    "read": { "ubus": { "tgeekddns": ["status"] } },
+    "write": { "ubus": { "tgeekddns": ["save", "enable", "disable"] } }
+  }
+}

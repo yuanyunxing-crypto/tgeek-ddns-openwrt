@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import syslog
 import tempfile
 import time
@@ -259,9 +260,56 @@ esac
 """
 
 
+def web(method):
+    if method == "status":
+        providers = {}
+        for provider in PROVIDERS:
+            path = ROOT / (provider + ".json")
+            if path.exists():
+                cfg = json.loads(path.read_text())
+                providers[provider] = {
+                    "domain": cfg["domain"], "rr": cfg["rr"], "records": cfg["records"],
+                    "credentials": bool(cfg.get("key") and cfg.get("secret")),
+                }
+        dump = subprocess.check_output(["ubus", "call", "network.interface", "dump"], timeout=3)
+        names = sorted(row["interface"] for row in json.loads(dump)["interface"])
+        return {"providers": providers, "interfaces": names, "enabled": HOOK.exists()}
+    if method != "save":
+        raise Failure("未知操作")
+    data = json.loads(json.load(sys.stdin)["payload"])
+    provider = data["provider"]
+    if provider not in PROVIDERS:
+        raise Failure("服务商无效")
+    path = ROOT / (provider + ".json")
+    old = json.loads(path.read_text()) if path.exists() else {}
+    domain = data["domain"].strip().rstrip(".").lower()
+    rr = data["rr"].strip().lower()
+    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
+        raise Failure("域名格式无效")
+    if rr != "@" and not re.fullmatch(r"[a-z0-9_-]+(?:\.[a-z0-9_-]+)*", rr):
+        raise Failure("主机记录格式无效")
+    if not data["records"] or set(data["records"]) - {"A", "AAAA"}:
+        raise Failure("请选择记录类型")
+    records = {}
+    for kind, record in data["records"].items():
+        source, record_id = record["source"].strip(), record["id"].strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]+", source) or not re.fullmatch(r"[0-9]+", record_id):
+            raise Failure(f"{kind} 接口或记录 ID 无效")
+        records[kind] = {"source": source, "id": record_id}
+    key, secret = data["key"].strip(), data["secret"].strip()
+    if bool(key) != bool(secret):
+        raise Failure("请同时填写两项凭据，或同时留空")
+    key, secret = (key, secret) if key else (old.get("key"), old.get("secret"))
+    if not key or not secret:
+        raise Failure("首次配置请填写两项凭据")
+    save(path, dict(domain=domain, rr=rr, key=key, secret=secret, records=records))
+    (RUN / "state.json").unlink(missing_ok=True)
+    return {}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("configure", "check", "sync", "enable", "disable", "event"))
+    parser.add_argument("mode", choices=("configure", "check", "sync", "enable", "disable", "event", "web"))
     parser.add_argument("args", nargs="*")
     args = parser.parse_args()
     os.umask(0o077)
@@ -284,7 +332,13 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.mode == "event" and not HOOK.exists():
             return 0
-        if args.mode == "configure":
+        if args.mode == "web":
+            try:
+                print(json.dumps(dict(ok=True, **web(args.args[0]))))
+            except (Failure, ValueError, OSError, TypeError, KeyError, AttributeError, subprocess.SubprocessError) as exc:
+                error = str(exc) if isinstance(exc, Failure) else "操作失败，请检查配置或系统状态"
+                print(json.dumps({"ok": False, "error": error}))
+        elif args.mode == "configure":
             if len(args.args) != 1 or args.args[0] not in PROVIDERS:
                 parser.error("configure 需要 aliyun 或 tencent")
             configure(args.args[0])
