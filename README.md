@@ -1,4 +1,38 @@
-# luci-app-tgeekddns v0.2.0
+# luci-app-tgeekddns v0.2.1
+
+## 从 GitHub 直接下载并安装
+
+适用于路由器可以直接访问 GitHub 的 OpenWrt。以下依赖命令以 OpenWrt 24.10（opkg）为例。已有可用 LuCI 时，跳过安装 luci-ssl 和启动 uhttpd 的三行。
+
+```sh
+opkg update
+opkg install luci-ssl
+/etc/init.d/uhttpd enable
+/etc/init.d/uhttpd start
+opkg install python3 ca-bundle
+```
+
+通过 SSH 以 root 执行。使用 v0.2.1 标签固定版本，下载或解压失败会停止安装。
+
+```sh
+(
+    set -e
+    workdir="$(mktemp -d /tmp/tgeekddns.XXXXXX)"
+    trap 'rm -rf "$workdir"' EXIT
+    cd "$workdir"
+    wget -O tgeek-ddns-openwrt-0.2.1.tar.gz 'https://github.com/yuanyunxing-crypto/tgeek-ddns-openwrt/archive/refs/tags/v0.2.1.tar.gz'
+    tar -xzf tgeek-ddns-openwrt-0.2.1.tar.gz
+    cd tgeek-ddns-openwrt-0.2.1
+    sh install.sh
+)
+```
+
+1. 重新登录 LuCI，打开 **服务 → TGEEK DDNS**。
+2. 选择阿里云或腾讯云，填写托管域名、主机记录和两项 API 凭据。勾选 A 或 AAAA，分别填写已有记录 ID，并选择对应的 OpenWrt 逻辑接口，例如 wan、wan2 或 wan6。
+3. 保存后在 SSH 执行 `tgeek-ddns check`，只读核对本机地址和云端记录。
+4. 确认无误后，在 LuCI 点 **启用事件更新**。要立即同步，可执行 `tgeek-ddns sync`，再用 `logread -e tgeek-ddns` 查看结果。
+
+若仓库改为私有，普通 wget 可能返回 404，可登录 GitHub 下载后按下方离线方式安装。
 
 OpenWrt LuCI 扩展，安装后进入 **服务 → TGEEK DDNS**。支持阿里云和腾讯云 DNSPod。页面可保存域名、主机记录、API 凭据，分别配置 A 和 AAAA 的记录 ID 与逻辑接口，并启停接口事件更新。
 
