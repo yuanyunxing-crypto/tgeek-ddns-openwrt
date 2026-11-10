@@ -42,45 +42,65 @@ function input(value, secret) {
 	});
 }
 
+function select(options, value) {
+	const node = E('select', { class: 'cbi-input-select' },
+		options.map(([id, name]) => E('option', { value: id }, name)));
+	node.value = value;
+	return node;
+}
+
 function panel(provider, name, config, interfaces) {
 	const cfg = config || {};
-	const rr = input(cfg.rr || '@');
-	const domain = input(cfg.domain);
 	const key = input('', true);
 	const secret = input('', true);
 	const result = E('p', { role: 'status' }, cfg.credentials ? '凭据已配置，两项留空沿用原值。' : '首次配置请填写两项凭据。');
-	const fields = [
-		field('托管域名', domain), field('主机记录', rr),
-		field(provider === 'aliyun' ? 'AccessKey ID' : 'SecretId', key),
-		field(provider === 'aliyun' ? 'AccessKey Secret' : 'SecretKey', secret)
-	];
-	const records = {};
-	for (const type of ['A', 'AAAA']) {
-		const record = (cfg.records || {})[type];
-		const checked = E('input', { type: 'checkbox' });
-		checked.checked = record ? true : (!config && type === 'A');
-		const id = input(record && record.id);
-		id.placeholder = "留空自动查找";
-		const source = E('select', { class: 'cbi-input-select' });
-		for (const name of new Set(['auto', ...interfaces, ...(record ? [record.source] : [])]))
-			source.appendChild(E('option', { value: name }, name === 'auto' ? '自动选择' : name));
-		source.value = record ? record.source : 'auto';
-		records[type] = { checked, id, source };
-		fields.push(field('更新 ' + type, checked), field(type + ' 接口', source), field(type + ' 记录 ID', id));
+	const list = E('div');
+	const rows = [];
+	const lines = [['any', '任意（只匹配唯一记录）'], ['default', '默认'],
+		['unicom', '联通'], ['telecom', '电信']];
+
+	function add(task) {
+		const domain = input(task.domain);
+		const rr = input(task.rr || '@');
+		const kind = select([['A', 'A (IPv4)'], ['AAAA', 'AAAA (IPv6)']], task.kind || 'A');
+		const line = select(lines, task.line || 'default');
+		const source = select(Array.from(new Set(['auto', ...interfaces, task.source || 'auto']),
+			id => [id, id === 'auto' ? '自动选择' : id]), task.source || 'auto');
+		const id = input(task.id);
+		id.placeholder = '留空自动查找';
+		const row = { domain, rr, kind, line, source, id };
+		const node = E('fieldset', { class: 'cbi-section' }, [
+			field('托管域名', domain), field('主机记录', rr),
+			field('记录类型', kind), field('云端解析线路', line),
+			field('OpenWrt 接口', source), field('记录 ID', id),
+			E('button', { type: 'button', class: 'cbi-button cbi-button-remove',
+				click: function() { rows.splice(rows.indexOf(row), 1); node.remove(); } }, '移除此任务')
+		]);
+		rows.push(row);
+		list.appendChild(node);
 	}
+
+	for (const task of cfg.tasks || [])
+		add(task);
+
 	return E('div', { class: 'cbi-section' }, [
-		E('h3', {}, name), ...fields,
+		E('h3', {}, name),
+		field(provider === 'aliyun' ? 'AccessKey ID' : 'SecretId', key),
+		field(provider === 'aliyun' ? 'AccessKey Secret' : 'SecretKey', secret),
+		list,
+		E('button', { type: 'button', class: 'cbi-button cbi-button-add', click: function() {
+			const previous = rows[rows.length - 1];
+			if (rows.length < 24)
+				add(previous ? { domain: previous.domain.value, rr: previous.rr.value,
+					kind: previous.kind.value } : {});
+		} }, '添加解析任务'),
+		' ',
 		button('保存 ' + name, async function() {
-			const selected = {};
-			for (const type of Object.keys(records)) {
-				const row = records[type];
-				if (row.checked.checked)
-					selected[type] = { id: row.id.value, source: row.source.value };
-			}
-			const response = await save(JSON.stringify({
-				provider, domain: domain.value, rr: rr.value, records: selected,
-				key: key.value, secret: secret.value
+			const tasks = rows.map(row => ({
+				domain: row.domain.value, rr: row.rr.value, kind: row.kind.value,
+				line: row.line.value, source: row.source.value, id: row.id.value
 			}));
+			const response = await save(JSON.stringify({ provider, tasks, key: key.value, secret: secret.value }));
 			if (response && response.ok)
 				key.value = secret.value = '';
 			return response;
